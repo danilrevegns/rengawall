@@ -4,13 +4,10 @@
 Три пользовательских свойства помещения задают тип: по ним выбирается правило
 (толщины, высота, стили, создавать ли пол/стены) из JSON-конфигурации.
 
-Требования: Python 3.8+, установленная Renga, pywin32.
-Запуск: откройте проект в Renga, затем:
-  python renga_room_finish.py
-    (все параметры старта запрашиваются в консоли)
+Требования: Python 3.8+, установленная Renga, pywin32, tkinter (GUI).
+Рекомендуемый запуск (см. README.md):
   python renga_room_finish.py --gui
-  python renga_room_finish.py -c room_finish_config.json --all-rooms
-    (режим без вопросов, для скриптов)
+Дополнительно: консольный мастер без аргументов, флаги --all-rooms / --selection и др.
 
 Документация API: https://help.rengabim.com/api/
 """
