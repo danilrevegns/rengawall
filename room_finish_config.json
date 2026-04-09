@@ -1,0 +1,33 @@
+{
+  "comment": "Укажите GUID трёх свойств помещения (как в Renga) и правила сопоставления. Совпадение — по строковому представлению значения (без учёта регистра).",
+  "property_ids": [
+    "{00000000-0000-0000-0000-000000000001}",
+    "{00000000-0000-0000-0000-000000000002}",
+    "{00000000-0000-0000-0000-000000000003}"
+  ],
+  "defaults": {
+    "create_floor": true,
+    "create_walls": true,
+    "floor_thickness_mm": 50,
+    "wall_thickness_mm": 120,
+    "wall_height_mm": 3000,
+    "floor_style_id": 0,
+    "wall_style_id": 0
+  },
+  "rules": [
+    {
+      "match": {
+        "0": "жилая",
+        "1": "сухая",
+        "2": "чистовая"
+      },
+      "create_floor": true,
+      "create_walls": true,
+      "floor_thickness_mm": 50,
+      "wall_thickness_mm": 100,
+      "wall_height_mm": 2800,
+      "floor_style_id": 0,
+      "wall_style_id": 0
+    }
+  ]
+}
