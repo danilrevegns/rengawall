@@ -248,6 +248,72 @@ def _room_seed_point(room_iface) -> Optional[Tuple[float, float]]:
         return None
 
 
+def _try_calculate_room_region(room_iface, log: Callable[[str], None]):
+    """
+    IRoom.CalculateRegion принимает Point2D по значению (UDT из типбиблиотеки Renga).
+    Объект Record('Point2D', ProgID), собранный в Python, часто даёт
+    DISP_E_TYPEMISMATCH (-2147352568, «Неверный тип переменной»).
+    Точки, полученные из свойств самого IRoom, уже имеют нужный COM-тип.
+    """
+    import pythoncom
+    import win32com.client
+
+    candidates = []
+    try:
+        if bool(room_iface.Automatic):
+            candidates.append(("ControlPoint", room_iface.ControlPoint))
+    except Exception:
+        pass
+    try:
+        candidates.append(("MarkerPosition", room_iface.MarkerPosition))
+    except Exception:
+        pass
+
+    last_error: Optional[Exception] = None
+    for _name, pt in candidates:
+        if pt is None:
+            continue
+        try:
+            rd = room_iface.CalculateRegion(pt)
+            if rd:
+                return rd
+        except Exception as ex:
+            last_error = ex
+            continue
+
+    seed = _room_seed_point(room_iface)
+    pt_rec = None
+    if seed and _records_available():
+        try:
+            pt_rec = _point2d(seed[0], seed[1])
+        except Exception as ex:
+            last_error = ex
+        if pt_rec is not None:
+            try:
+                rd = room_iface.CalculateRegion(pt_rec)
+                if rd:
+                    return rd
+            except Exception as ex:
+                last_error = ex
+            try:
+                if hasattr(pythoncom, "VT_RECORD"):
+                    v = win32com.client.VARIANT(pythoncom.VT_RECORD, pt_rec)
+                    rd = room_iface.CalculateRegion(v)
+                    if rd:
+                        return rd
+            except Exception as ex:
+                last_error = ex
+
+    if last_error is not None:
+        log("CalculateRegion не удался: %s" % last_error)
+    else:
+        log(
+            "CalculateRegion вернул пусто (точка вне помещения, на границе "
+            "или нет подходящей опорной точки)."
+        )
+    return None
+
+
 def _iter_outer_segments(region_desc) -> Iterator:
     reg = region_desc.Region
     outer = reg.GetOuterContour()
@@ -334,22 +400,15 @@ def process_room(
         log("Не удалось опорную точку помещения id=%s." % room_mo.Id)
         return
 
+    region_desc = _try_calculate_room_region(room, log)
+    if not region_desc:
+        return
+
     if not _records_available():
         raise RuntimeError(
             "Нужен win32com.client.Record (обновите pywin32). "
             "Структуры Point2D/Placement3D передаются через тип библиотеки Renga."
         )
-
-    px, py = seed
-    room_pt = _point2d(px, py)
-    try:
-        region_desc = room.CalculateRegion(room_pt)
-    except Exception as ex:
-        log("CalculateRegion не удался: %s" % ex)
-        return
-    if not region_desc:
-        log("CalculateRegion вернул пусто (точка вне помещения?).")
-        return
 
     level_obj = room_mo.GetInterfaceByName("ILevelObject")
     if not level_obj:
