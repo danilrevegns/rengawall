@@ -28,11 +28,24 @@ ENTITY_FLOOR = "{f5bd8bd8-39c1-47f8-8499-f673c580dfbe}"
 
 PARAM_WALL_HEIGHT = "{0c6c933c-e47c-40d2-ba84-b8ae5ccec6f1}"
 PARAM_WALL_THICKNESS = "{25548335-7030-43b1-b602-9898f3adc3b0}"
+# Положение тела стены относительно линии baseline (как RampPositionRelativeToBaseline):
+# 0 — вправо, 1 — по центру (дефолт Renga: половина внутрь помещения), 2 — влево.
+PARAM_WALL_POSITION_RELATIVE_TO_BASELINE = (
+    "{3df76fae-fc0f-4378-a493-8506bb19deb5}"
+)
 PARAM_FLOOR_THICKNESS = "{f2712442-b9df-44fe-ac7b-c3524342c804}"
 
+# Значения WallPositionRelativeToBaseline (документация Renga API)
+WALL_BASELINE_RIGHT = 0
+WALL_BASELINE_CENTER = 1
+WALL_BASELINE_LEFT = 2
+
+CURVE2D_UNDEFINED = 0
 CURVE2D_LINE = 1
 CURVE2D_ARC = 2
 CURVE2D_POLY = 3
+
+_MAX_POLY_RECURSE = 64
 
 RECORD_PROG_ID = "Renga.Application.1"
 
@@ -95,8 +108,10 @@ def _get_property_text(prop) -> str:
     for getter in (
         "GetStringValue",
         "GetEnumerationValue",
+        "GetIntValue",
         "GetIntegerValue",
         "GetDoubleValue",
+        "GetBoolValue",
     ):
         if hasattr(prop, getter):
             try:
@@ -225,40 +240,39 @@ def _outer_contour_vertex_chain_global(
 ) -> List[Tuple[float, float]]:
     """Упорядоченные вершины внешнего контура в ГСК (план)."""
     verts: List[Tuple[float, float]] = []
-    for seg in _iter_outer_segments(region_desc, Renga):
-        for prim in _expand_curve_segments(seg, Renga):
-            try:
-                ct = int(prim.Curve2DType)
-            except Exception:
-                ct = CURVE2D_LINE
-            if ct == CURVE2D_LINE:
-                ends = _curve_endpoints(prim)
-                if not ends:
-                    continue
-                (sx, sy), (ex, ey) = ends
-                if not verts:
-                    verts.append((sx, sy))
-                verts.append((ex, ey))
-            elif ct == CURVE2D_ARC:
-                arc_pts = _sample_arc_points_xy(prim, 12, log)
-                if not arc_pts:
-                    continue
-                if not verts:
-                    verts.append(arc_pts[0])
-                for p in arc_pts[1:]:
-                    verts.append(p)
-            else:
-                ends = _curve_endpoints(prim)
-                if not ends:
-                    log(
-                        "Сегмент типа %s без концов — пропуск при построении контура пола."
-                        % ct
-                    )
-                    continue
-                (sx, sy), (ex, ey) = ends
-                if not verts:
-                    verts.append((sx, sy))
-                verts.append((ex, ey))
+    for prim in _iter_outer_segments(region_desc, Renga):
+        try:
+            ct = int(prim.Curve2DType)
+        except Exception:
+            ct = CURVE2D_LINE
+        if ct == CURVE2D_LINE:
+            ends = _curve_endpoints(prim)
+            if not ends:
+                continue
+            (sx, sy), (ex, ey) = ends
+            if not verts:
+                verts.append((sx, sy))
+            verts.append((ex, ey))
+        elif ct == CURVE2D_ARC:
+            arc_pts = _sample_arc_points_xy(prim, 12, log)
+            if not arc_pts:
+                continue
+            if not verts:
+                verts.append(arc_pts[0])
+            for p in arc_pts[1:]:
+                verts.append(p)
+        else:
+            ends = _curve_endpoints(prim)
+            if not ends:
+                log(
+                    "Сегмент типа %s без концов — пропуск при построении контура пола."
+                    % ct
+                )
+                continue
+            (sx, sy), (ex, ey) = ends
+            if not verts:
+                verts.append((sx, sy))
+            verts.append((ex, ey))
     if len(verts) >= 2:
         a, b = verts[0], verts[-1]
         if math.hypot(a[0] - b[0], a[1] - b[1]) < 1e-3:
@@ -299,6 +313,18 @@ def _vertex_chain_to_closed_global_lines(
             log("CreateLineSegment2D (контур пола): %s" % ex)
             return []
     return lines
+
+
+def _local_xy_to_global_xy(
+    lx: float,
+    ly: float,
+    origin,
+    axis_x,
+    axis_y,
+) -> Tuple[float, float]:
+    gx = float(origin.X) + lx * float(axis_x.X) + ly * float(axis_y.X)
+    gy = float(origin.Y) + lx * float(axis_x.Y) + ly * float(axis_y.Y)
+    return gx, gy
 
 
 def _global_xy_to_local_xy(
@@ -421,7 +447,7 @@ def _vector3d(Renga, x: float, y: float, z: float):
 
 def _placement2d_identity(Renga):
     pl = Renga.Placement2D()
-    pl.origin = _point2d(Renga, 0.0, 0.0)
+    pl.Origin = _point2d(Renga, 0.0, 0.0)
     v = Renga.Vector2D()
     v.X, v.Y = 1.0, 0.0
     pl.xAxis = v
@@ -455,24 +481,88 @@ def _curve_endpoints(curve) -> Optional[Tuple[Tuple[float, float], Tuple[float, 
 
 
 def _expand_curve_segments(curve, Renga) -> List:
-    """Разворачивает полилинию в список примитивов (отрезок / дуга)."""
-    try:
-        ct = int(curve.Curve2DType)
-    except Exception:
+    """Один уровень: полилиния → сегменты (устар., см. _atomic_curve_segments)."""
+    return _atomic_curve_segments(curve, Renga, 0)
+
+
+def _atomic_curve_segments(curve, Renga, depth: int = 0) -> List:
+    """
+    Рекурсивно раскрывает контур до атомарных ICurve2D (отрезок/дуга).
+    Сначала QueryInterface(IPolyCurve2D) — в TLB тип Curve2DType может быть Undefined,
+    хотя контур — полилиния (документация Renga: cast к IPolyCurve2D).
+    """
+    if depth > _MAX_POLY_RECURSE:
         return [curve]
-    if ct != CURVE2D_POLY:
-        return [curve]
+    poly = None
     try:
         poly = curve.QueryInterface(Renga.IPolyCurve2D)
     except Exception:
         poly = None
-    if not poly:
+    if poly is not None:
+        try:
+            n = int(poly.GetSegmentCount())
+        except Exception:
+            n = 0
+        if n <= 0:
+            return [curve]
+        out: List = []
+        for i in range(n):
+            try:
+                sub = poly.GetSegment(int(i))
+            except Exception:
+                continue
+            if sub is None:
+                continue
+            out.extend(_atomic_curve_segments(sub, Renga, depth + 1))
+        return out if out else [curve]
+    try:
+        ct = int(curve.Curve2DType)
+    except Exception:
         return [curve]
-    n = int(poly.GetSegmentCount())
-    segs = []
-    for i in range(n):
-        segs.append(poly.GetSegment(i))
-    return segs
+    if ct == CURVE2D_POLY:
+        return [curve]
+    return [curve]
+
+
+def _ring_centroid_xy(verts: List[Tuple[float, float]]) -> Tuple[float, float]:
+    if not verts:
+        return 0.0, 0.0
+    sx = sum(x for x, _ in verts)
+    sy = sum(y for _, y in verts)
+    n = float(len(verts))
+    return sx / n, sy / n
+
+
+def _inward_normal_for_segment(
+    sx: float,
+    sy: float,
+    ex: float,
+    ey: float,
+    seed_x: float,
+    seed_y: float,
+    cx: float,
+    cy: float,
+) -> Optional[Tuple[float, float]]:
+    """
+    Единичная нормаль к отрезку, направленная к «внутренней» стороне (к опорной точке
+    помещения или к центроиду контура), чтобы сместить baseline внутрь площади.
+    """
+    dx = ex - sx
+    dy = ey - sy
+    ln = math.hypot(dx, dy)
+    if ln < 1e-9:
+        return None
+    ux, uy = dx / ln, dy / ln
+    n1x, n1y = -uy, ux
+    mx, my = (sx + ex) * 0.5, (sy + ey) * 0.5
+    for px, py in ((seed_x, seed_y), (cx, cy)):
+        vx, vy = px - mx, py - my
+        dot = n1x * vx + n1y * vy
+        if dot > 1e-6:
+            return n1x, n1y
+        if dot < -1e-6:
+            return -n1x, -n1y
+    return n1x, n1y
 
 
 def _room_seed_point(room_iface) -> Optional[Tuple[float, float]]:
@@ -543,7 +633,7 @@ def _try_calculate_room_region(
 def _iter_outer_segments(region_desc, Renga) -> Iterator:
     reg = region_desc.Region
     outer = reg.GetOuterContour()
-    for prim in _expand_curve_segments(outer, Renga):
+    for prim in _atomic_curve_segments(outer, Renga, 0):
         yield prim
 
 
@@ -552,33 +642,32 @@ def _build_curves_for_composite(
 ) -> List:
     """Сегменты внешнего контура: отрезки через Point2D, дуги — GetCopy (test_floor_coor)."""
     curves: List = []
-    for seg in _iter_outer_segments(region_desc, Renga):
-        for prim in _expand_curve_segments(seg, Renga):
+    for prim in _iter_outer_segments(region_desc, Renga):
+        try:
+            ct = int(prim.Curve2DType)
+        except Exception:
+            ct = CURVE2D_LINE
+        if ct == CURVE2D_LINE:
+            ends = _curve_endpoints(prim)
+            if not ends:
+                continue
+            (sx, sy), (ex, ey) = ends
+            p1 = _point2d(Renga, sx, sy)
+            p2 = _point2d(Renga, ex, ey)
             try:
-                ct = int(prim.Curve2DType)
+                curves.append(math_iface.CreateLineSegment2D(p1, p2))
+            except Exception as ex:
+                log("CreateLineSegment2D: %s" % ex)
+        elif ct == CURVE2D_ARC:
+            try:
+                curves.append(prim.GetCopy())
+            except Exception as ex:
+                log("Дуга контура: %s" % ex)
+        else:
+            try:
+                curves.append(prim.GetCopy())
             except Exception:
-                ct = CURVE2D_LINE
-            if ct == CURVE2D_LINE:
-                ends = _curve_endpoints(prim)
-                if not ends:
-                    continue
-                (sx, sy), (ex, ey) = ends
-                p1 = _point2d(Renga, sx, sy)
-                p2 = _point2d(Renga, ex, ey)
-                try:
-                    curves.append(math_iface.CreateLineSegment2D(p1, p2))
-                except Exception as ex:
-                    log("CreateLineSegment2D: %s" % ex)
-            elif ct == CURVE2D_ARC:
-                try:
-                    curves.append(prim.GetCopy())
-                except Exception as ex:
-                    log("Дуга контура: %s" % ex)
-            else:
-                try:
-                    curves.append(prim.GetCopy())
-                except Exception:
-                    pass
+                pass
     return curves
 
 
@@ -621,6 +710,60 @@ def _set_params_double(obj, guid_s: str, value: float) -> None:
     p = params.GetS(guid_s)
     if p:
         p.SetDoubleValue(float(value))
+
+
+def _set_wall_position_relative_to_baseline(obj, value: int) -> None:
+    """Смещение толщины стены относительно baseline (не «из центра» в помещение)."""
+    params = obj.GetParameters()
+    p = params.GetS(PARAM_WALL_POSITION_RELATIVE_TO_BASELINE)
+    if not p:
+        return
+    v = int(value)
+    for name in ("SetIntValue", "SetIntegerValue", "SetEnumerationValue", "SetLongValue"):
+        if hasattr(p, name):
+            try:
+                getattr(p, name)(v)
+                return
+            except Exception:
+                continue
+
+
+def _init_finish_wall_parameters(
+    wall_mo, wh: float, wt: float, wall_baseline_pos: int
+) -> None:
+    """Параметры стены до SetBaseline — иначе Renga оставляет центрирование по baseline."""
+    _set_params_double(wall_mo, PARAM_WALL_HEIGHT, wh)
+    _set_params_double(wall_mo, PARAM_WALL_THICKNESS, wt)
+    _set_wall_position_relative_to_baseline(wall_mo, wall_baseline_pos)
+
+
+def _signed_area_xy_ring(verts: List[Tuple[float, float]]) -> float:
+    """Удвоенная площадь / 2; знак задаёт обход (CCW > 0 в стандартной XY)."""
+    if len(verts) < 3:
+        return 0.0
+    s = 0.0
+    n = len(verts)
+    for i in range(n):
+        x1, y1 = verts[i]
+        x2, y2 = verts[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return 0.5 * s
+
+
+def _auto_wall_baseline_position(
+    floor_verts: List[Tuple[float, float]],
+) -> int:
+    """
+    Отделочная стена должна целиком уходить внутрь контура помещения.
+    Для CCW внешнего контура внутренняя сторона ребра — «слева» по ходу обхода
+    → WallPositionRelativeToBaseline = Left (2); для CW — Right (0).
+    """
+    a = _signed_area_xy_ring(floor_verts)
+    if a > 0:
+        return WALL_BASELINE_LEFT
+    if a < 0:
+        return WALL_BASELINE_RIGHT
+    return WALL_BASELINE_LEFT
 
 
 def process_room(
@@ -695,6 +838,7 @@ def process_room(
 
     math = app.Math
     project = app.Project
+
     floor_verts = _outer_contour_vertex_chain_global(region_desc, Renga, log)
     floor_global_lines = _vertex_chain_to_closed_global_lines(
         math, Renga, floor_verts, log
@@ -773,64 +917,93 @@ def process_room(
             wh = float(merged.get("wall_height_mm", 3000))
             wt = float(merged.get("wall_thickness_mm", 120))
             wstyle = int(merged.get("wall_style_id", 0) or 0)
-            for seg in _iter_outer_segments(region_desc, Renga):
-                for prim in _expand_curve_segments(seg, Renga):
-                    wall_mo = None
-                    try:
-                        ct = int(prim.Curve2DType)
-                    except Exception:
-                        ct = CURVE2D_LINE
-                    args = model.CreateNewEntityArgs()
-                    args.TypeIdS = ENTITY_WALL
-                    args.HostObjectId = level_id
-                    if wstyle:
-                        args.StyleId = wstyle
-                    if ct == CURVE2D_LINE:
-                        ends = _curve_endpoints(prim)
-                        if not ends:
-                            continue
-                        (sx, sy), (ex, ey) = ends
-                        pl_data = _placement3d_from_segment(
-                            Renga, sx, sy, z_level, ex, ey
-                        )
-                        if not pl_data:
-                            continue
-                        pl3, ln = pl_data
-                        args.Placement3D = pl3
-                        wall_mo = model.CreateObject(args)
-                        if not wall_mo:
-                            continue
-                        bl = _query_iface(
-                            wall_mo, Renga, "IBaseline2DObject", dynamic
-                        )
-                        if bl:
-                            loc = math.CreateLineSegment2D(
-                                _point2d(Renga, 0.0, 0.0),
-                                _point2d(Renga, ln, 0.0),
-                            )
-                            bl.SetBaseline(loc)
-                    elif ct == CURVE2D_ARC:
-                        wall_mo = model.CreateObject(args)
-                        if not wall_mo:
-                            continue
-                        bl = _query_iface(
-                            wall_mo, Renga, "IBaseline2DObject", dynamic
-                        )
-                        if bl:
-                            try:
-                                arc_c = prim.GetCopy()
-                                bl.SetBaselineInCS(
-                                    _placement2d_identity(Renga), arc_c
-                                )
-                            except Exception as ex:
-                                log("Дуга стены id=%s: %s" % (wall_mo.Id, ex))
-                    else:
-                        log("Пропуск сегмента неподдерживаемого типа кривой: %s" % ct)
+            wall_pos_cfg = merged.get(
+                "wall_position_relative_to_baseline", None
+            )
+            if wall_pos_cfg is None:
+                wall_baseline_pos = _auto_wall_baseline_position(floor_verts)
+            else:
+                wall_baseline_pos = int(wall_pos_cfg)
+            cx_c, cy_c = _ring_centroid_xy(floor_verts)
+            geom_inset = merged.get("wall_geometric_inset_from_contour", True)
+            raw_inset = merged.get("wall_contour_inset_mm", None)
+            if not geom_inset:
+                wall_inset_mm = 0.0
+            elif raw_inset is not None:
+                wall_inset_mm = float(raw_inset)
+            else:
+                wall_inset_mm = wt * 0.5
+            for prim in _iter_outer_segments(region_desc, Renga):
+                wall_mo = None
+                try:
+                    ct = int(prim.Curve2DType)
+                except Exception:
+                    ct = CURVE2D_LINE
+                args = model.CreateNewEntityArgs()
+                args.TypeIdS = ENTITY_WALL
+                args.HostObjectId = level_id
+                if wstyle:
+                    args.StyleId = wstyle
+                if ct == CURVE2D_LINE:
+                    ends = _curve_endpoints(prim)
+                    if not ends:
                         continue
-
-                    if wall_mo:
-                        _set_params_double(wall_mo, PARAM_WALL_HEIGHT, wh)
-                        _set_params_double(wall_mo, PARAM_WALL_THICKNESS, wt)
+                    (sx, sy), (ex, ey) = ends
+                    line_pos = wall_baseline_pos
+                    if wall_inset_mm > 1e-6:
+                        nrm = _inward_normal_for_segment(
+                            sx,
+                            sy,
+                            ex,
+                            ey,
+                            seed[0],
+                            seed[1],
+                            cx_c,
+                            cy_c,
+                        )
+                        if nrm is not None:
+                            nx, ny = nrm
+                            sx += nx * wall_inset_mm
+                            sy += ny * wall_inset_mm
+                            ex += nx * wall_inset_mm
+                            ey += ny * wall_inset_mm
+                            line_pos = WALL_BASELINE_CENTER
+                    wall_mo = model.CreateObject(args)
+                    if not wall_mo:
+                        continue
+                    _init_finish_wall_parameters(wall_mo, wh, wt, line_pos)
+                    bl = _query_iface(
+                        wall_mo, Renga, "IBaseline2DObject", dynamic
+                    )
+                    if bl:
+                        loc = math.CreateLineSegment2D(
+                            _point2d(Renga, sx, sy),
+                            _point2d(Renga, ex, ey),
+                        )
+                        bl.SetBaseline(loc)
+                elif ct == CURVE2D_ARC:
+                    wall_mo = model.CreateObject(args)
+                    if not wall_mo:
+                        continue
+                    _init_finish_wall_parameters(
+                        wall_mo, wh, wt, wall_baseline_pos
+                    )
+                    bl = _query_iface(
+                        wall_mo, Renga, "IBaseline2DObject", dynamic
+                    )
+                    if bl:
+                        try:
+                            arc_c = prim.GetCopy()
+                            bl.SetBaselineInCS(
+                                _placement2d_identity(Renga), arc_c
+                            )
+                        except Exception as ex:
+                            log("Дуга стены id=%s: %s" % (wall_mo.Id, ex))
+                else:
+                    log(
+                        "Пропуск сегмента неподдерживаемого типа кривой: %s" % ct
+                    )
+                    continue
         op.Apply()
         log("Изменения применены для помещения id=%s." % room_mo.Id)
     except Exception:
