@@ -1,18 +1,18 @@
 {
-  "comment": "Укажите GUID трёх свойств помещения (как в Renga) и правила сопоставления. Совпадение — по строковому представлению значения (без учёта регистра).",
+  "comment": "Укажите GUID трёх свойств помещения (как в Renga) и правила сопоставления. Совпадение — по строковому представлению значения (без учёта регистра). Стены: wall_geometric_inset_from_contour (по умолчанию true) — baseline прямых стен смещается внутрь на половину толщины, внутренняя грань по контуру помещения; wall_contour_inset_mm — смещение в мм (иначе = wall_thickness_mm/2). Для дуг и при wall_geometric_inset_from_contour=false используется wall_position_relative_to_baseline: 0=вправо, 1=центр, 2=влево (если не задано — авто по обходу контура).",
   "property_ids": [
-    "{3713baac-2f29-4a49-8c6e-f191da165e2e}",
-    "{9839b619-8cc9-445c-a108-799e6d962eab}",
-    "{f8af86f9-9bf5-465f-8791-03e8a19fbbd5}"
+    "{502a2a43-9d1a-4fb6-ae92-7059040b4c98}",
+    "{c4ee2861-b028-4b89-b8fe-c0445721fc89}",
+    "{3713baac-2f29-4a49-8c6e-f191da165e2e}"
   ],
   "defaults": {
-    "create_floor": true,
+    "create_floor": false,
     "create_walls": true,
-    "floor_thickness_mm": 50,
+    "floor_thickness_mm": 500,
     "wall_thickness_mm": 120,
     "wall_height_mm": 3000,
-    "floor_style_id": 0,
-    "wall_style_id": 0
+    "floor_style_id": 1,
+    "wall_style_id": 2
   },
   "rules": [
     {
@@ -21,12 +21,12 @@
         "1": "сухая",
         "2": "чистовая"
       },
-      "create_floor": true,
+      "create_floor": false,
       "create_walls": true,
-      "floor_thickness_mm": 50,
-      "wall_thickness_mm": 100,
-      "wall_height_mm": 2800,
-      "floor_style_id": 0,
+      "floor_thickness_mm": 100,
+      "wall_thickness_mm": 200,
+      "wall_height_mm": 3000,
+      "floor_style_id": 1,
       "wall_style_id": 0
     }
   ]
