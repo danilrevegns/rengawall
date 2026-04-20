@@ -4,20 +4,13 @@
 Три пользовательских свойства помещения задают тип: по ним выбирается правило
 (толщины, высота, стили, создавать ли пол/стены) из JSON-конфигурации.
 
-Требования: Python 3.8+, установленная Renga, comtypes (генерация Renga.tlb), tkinter (GUI).
-Рекомендуемый запуск (см. README.md):
-  python renga_room_finish.py --gui
-Дополнительно: консольный мастер без аргументов, флаги --all-rooms / --selection и др.
-
 Документация API: https://help.rengabim.com/api/
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import math
-import sys
 import traceback
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -28,17 +21,7 @@ ENTITY_FLOOR = "{f5bd8bd8-39c1-47f8-8499-f673c580dfbe}"
 
 PARAM_WALL_HEIGHT = "{0c6c933c-e47c-40d2-ba84-b8ae5ccec6f1}"
 PARAM_WALL_THICKNESS = "{25548335-7030-43b1-b602-9898f3adc3b0}"
-# Положение тела стены относительно линии baseline (как RampPositionRelativeToBaseline):
-# 0 — вправо, 1 — по центру (дефолт Renga: половина внутрь помещения), 2 — влево.
-PARAM_WALL_POSITION_RELATIVE_TO_BASELINE = (
-    "{3df76fae-fc0f-4378-a493-8506bb19deb5}"
-)
 PARAM_FLOOR_THICKNESS = "{f2712442-b9df-44fe-ac7b-c3524342c804}"
-
-# Значения WallPositionRelativeToBaseline (документация Renga API)
-WALL_BASELINE_RIGHT = 0
-WALL_BASELINE_CENTER = 1
-WALL_BASELINE_LEFT = 2
 
 CURVE2D_UNDEFINED = 0
 CURVE2D_LINE = 1
@@ -48,6 +31,7 @@ CURVE2D_POLY = 3
 _MAX_POLY_RECURSE = 64
 
 RECORD_PROG_ID = "Renga.Application.1"
+DEFAULT_CONFIG_PATH = "room_finish_config.json"
 
 
 def _norm_guid(g: str) -> str:
@@ -136,7 +120,7 @@ def _room_type_triple(model_object, property_ids: List[str]) -> Tuple[str, str, 
 
 
 def _load_renga_comtypes():
-    """Типы Point2D/Placement3D из TLB Renga (как в test_floor_coor.py)."""
+    """Типы Point2D/Placement3D из TLB Renga."""
     import comtypes.client.dynamic as dynamic
     import comtypes.gen.Renga as Renga
 
@@ -167,7 +151,7 @@ def _query_iface(com_obj, Renga, iface_name: str, dynamic_mod) -> Any:
 
 
 def _placement_axes_2d(Renga, placement) -> Tuple[Any, Any, Any]:
-    """Origin, axis X, axis Y в плоскости этажа (как в test_floor.py)."""
+    """Origin, axis X, axis Y в плоскости этажа."""
     origin = placement.Origin
     axis_x = placement.AxisX
     try:
@@ -454,23 +438,6 @@ def _placement2d_identity(Renga):
     return pl
 
 
-def _placement3d_from_segment(
-    Renga, sx: float, sy: float, sz: float, ex: float, ey: float
-):
-    """ЛСК стены: начало в S, ось X вдоль сегмента в плоскости этажа."""
-    dx = ex - sx
-    dy = ey - sy
-    ln = math.hypot(dx, dy)
-    if ln < 1e-6:
-        return None
-    ux, uy = dx / ln, dy / ln
-    pl = Renga.Placement3D()
-    pl.origin = _point3d(Renga, sx, sy, sz)
-    pl.xAxis = _vector3d(Renga, ux, uy, 0.0)
-    pl.zAxis = _vector3d(Renga, 0.0, 0.0, 1.0)
-    return pl, ln
-
-
 def _curve_endpoints(curve) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
     try:
         b = curve.GetBeginPoint()
@@ -478,11 +445,6 @@ def _curve_endpoints(curve) -> Optional[Tuple[Tuple[float, float], Tuple[float, 
         return (float(b.X), float(b.Y)), (float(e.X), float(e.Y))
     except Exception:
         return None
-
-
-def _expand_curve_segments(curve, Renga) -> List:
-    """Один уровень: полилиния → сегменты (устар., см. _atomic_curve_segments)."""
-    return _atomic_curve_segments(curve, Renga, 0)
 
 
 def _atomic_curve_segments(curve, Renga, depth: int = 0) -> List:
@@ -637,40 +599,6 @@ def _iter_outer_segments(region_desc, Renga) -> Iterator:
         yield prim
 
 
-def _build_curves_for_composite(
-    math_iface, Renga, region_desc, log: Callable[[str], None]
-) -> List:
-    """Сегменты внешнего контура: отрезки через Point2D, дуги — GetCopy (test_floor_coor)."""
-    curves: List = []
-    for prim in _iter_outer_segments(region_desc, Renga):
-        try:
-            ct = int(prim.Curve2DType)
-        except Exception:
-            ct = CURVE2D_LINE
-        if ct == CURVE2D_LINE:
-            ends = _curve_endpoints(prim)
-            if not ends:
-                continue
-            (sx, sy), (ex, ey) = ends
-            p1 = _point2d(Renga, sx, sy)
-            p2 = _point2d(Renga, ex, ey)
-            try:
-                curves.append(math_iface.CreateLineSegment2D(p1, p2))
-            except Exception as ex:
-                log("CreateLineSegment2D: %s" % ex)
-        elif ct == CURVE2D_ARC:
-            try:
-                curves.append(prim.GetCopy())
-            except Exception as ex:
-                log("Дуга контура: %s" % ex)
-        else:
-            try:
-                curves.append(prim.GetCopy())
-            except Exception:
-                pass
-    return curves
-
-
 def _set_floor_baseline(
     floor_mo,
     composite_curve,
@@ -712,58 +640,12 @@ def _set_params_double(obj, guid_s: str, value: float) -> None:
         p.SetDoubleValue(float(value))
 
 
-def _set_wall_position_relative_to_baseline(obj, value: int) -> None:
-    """Смещение толщины стены относительно baseline (не «из центра» в помещение)."""
-    params = obj.GetParameters()
-    p = params.GetS(PARAM_WALL_POSITION_RELATIVE_TO_BASELINE)
-    if not p:
-        return
-    v = int(value)
-    for name in ("SetIntValue", "SetIntegerValue", "SetEnumerationValue", "SetLongValue"):
-        if hasattr(p, name):
-            try:
-                getattr(p, name)(v)
-                return
-            except Exception:
-                continue
-
-
 def _init_finish_wall_parameters(
-    wall_mo, wh: float, wt: float, wall_baseline_pos: int
+    wall_mo, wh: float, wt: float
 ) -> None:
-    """Параметры стены до SetBaseline — иначе Renga оставляет центрирование по baseline."""
+    """Параметры стены."""
     _set_params_double(wall_mo, PARAM_WALL_HEIGHT, wh)
     _set_params_double(wall_mo, PARAM_WALL_THICKNESS, wt)
-    _set_wall_position_relative_to_baseline(wall_mo, wall_baseline_pos)
-
-
-def _signed_area_xy_ring(verts: List[Tuple[float, float]]) -> float:
-    """Удвоенная площадь / 2; знак задаёт обход (CCW > 0 в стандартной XY)."""
-    if len(verts) < 3:
-        return 0.0
-    s = 0.0
-    n = len(verts)
-    for i in range(n):
-        x1, y1 = verts[i]
-        x2, y2 = verts[(i + 1) % n]
-        s += x1 * y2 - x2 * y1
-    return 0.5 * s
-
-
-def _auto_wall_baseline_position(
-    floor_verts: List[Tuple[float, float]],
-) -> int:
-    """
-    Отделочная стена должна целиком уходить внутрь контура помещения.
-    Для CCW внешнего контура внутренняя сторона ребра — «слева» по ходу обхода
-    → WallPositionRelativeToBaseline = Left (2); для CW — Right (0).
-    """
-    a = _signed_area_xy_ring(floor_verts)
-    if a > 0:
-        return WALL_BASELINE_LEFT
-    if a < 0:
-        return WALL_BASELINE_RIGHT
-    return WALL_BASELINE_LEFT
 
 
 def process_room(
@@ -825,16 +707,6 @@ def process_room(
     if not ilvl:
         log("Не найден уровень id=%s." % level_id)
         return
-    z_level = float(ilvl.Elevation)
-    try:
-        placement = ilvl.Placement
-        z_level = float(placement.Origin.Z)
-    except Exception:
-        try:
-            placement = ilvl.GetPlacement()
-            z_level = float(placement.Origin.Z)
-        except Exception:
-            pass
 
     math = app.Math
     project = app.Project
@@ -917,13 +789,7 @@ def process_room(
             wh = float(merged.get("wall_height_mm", 3000))
             wt = float(merged.get("wall_thickness_mm", 120))
             wstyle = int(merged.get("wall_style_id", 0) or 0)
-            wall_pos_cfg = merged.get(
-                "wall_position_relative_to_baseline", None
-            )
-            if wall_pos_cfg is None:
-                wall_baseline_pos = _auto_wall_baseline_position(floor_verts)
-            else:
-                wall_baseline_pos = int(wall_pos_cfg)
+            
             cx_c, cy_c = _ring_centroid_xy(floor_verts)
             geom_inset = merged.get("wall_geometric_inset_from_contour", True)
             raw_inset = merged.get("wall_contour_inset_mm", None)
@@ -933,6 +799,7 @@ def process_room(
                 wall_inset_mm = float(raw_inset)
             else:
                 wall_inset_mm = wt * 0.5
+                
             for prim in _iter_outer_segments(region_desc, Renga):
                 wall_mo = None
                 try:
@@ -949,7 +816,6 @@ def process_room(
                     if not ends:
                         continue
                     (sx, sy), (ex, ey) = ends
-                    line_pos = wall_baseline_pos
                     if wall_inset_mm > 1e-6:
                         nrm = _inward_normal_for_segment(
                             sx,
@@ -967,11 +833,11 @@ def process_room(
                             sy += ny * wall_inset_mm
                             ex += nx * wall_inset_mm
                             ey += ny * wall_inset_mm
-                            line_pos = WALL_BASELINE_CENTER
+                    
                     wall_mo = model.CreateObject(args)
                     if not wall_mo:
                         continue
-                    _init_finish_wall_parameters(wall_mo, wh, wt, line_pos)
+                    _init_finish_wall_parameters(wall_mo, wh, wt)
                     bl = _query_iface(
                         wall_mo, Renga, "IBaseline2DObject", dynamic
                     )
@@ -985,9 +851,7 @@ def process_room(
                     wall_mo = model.CreateObject(args)
                     if not wall_mo:
                         continue
-                    _init_finish_wall_parameters(
-                        wall_mo, wh, wt, wall_baseline_pos
-                    )
+                    _init_finish_wall_parameters(wall_mo, wh, wt)
                     bl = _query_iface(
                         wall_mo, Renga, "IBaseline2DObject", dynamic
                     )
@@ -1071,237 +935,3 @@ def run_batch(
             log("Объект id=%s не найден." % rid)
             continue
         process_room(app, model, objects, mo, cfg, log)
-
-
-def _gui_main(config_path: str) -> None:
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, scrolledtext
-
-    root = tk.Tk()
-    root.title("Renga: пол и стены по контуру помещения")
-    root.geometry("720x520")
-
-    cfg_var = tk.StringVar(value=config_path or "room_finish_config.json")
-    log_widget = scrolledtext.ScrolledText(root, height=18, state=tk.DISABLED)
-
-    def log(msg: str) -> None:
-        log_widget.configure(state=tk.NORMAL)
-        log_widget.insert("end", msg + "\n")
-        log_widget.see("end")
-        log_widget.configure(state=tk.DISABLED)
-        root.update_idletasks()
-
-    def browse_cfg():
-        p = filedialog.askopenfilename(
-            title="Конфигурация JSON",
-            filetypes=[("JSON", "*.json"), ("Все", "*.*")],
-        )
-        if p:
-            cfg_var.set(p)
-
-    def run_clicked():
-        path = cfg_var.get().strip()
-        if not path:
-            messagebox.showerror("Ошибка", "Укажите файл конфигурации.")
-            return
-        try:
-            run_batch(path, [], "all", True, log)
-            messagebox.showinfo("Готово", "Обработка завершена (см. журнал).")
-        except Exception as ex:
-            log(str(ex))
-            messagebox.showerror("Ошибка", str(ex))
-
-    def run_selection():
-        path = cfg_var.get().strip()
-        if not path:
-            messagebox.showerror("Ошибка", "Укажите файл конфигурации.")
-            return
-        try:
-            run_batch(path, [], "selection", True, log)
-            messagebox.showinfo("Готово", "Обработка выбранных помещений завершена.")
-        except Exception as ex:
-            log(str(ex))
-            messagebox.showerror("Ошибка", str(ex))
-
-    frm = tk.Frame(root)
-    frm.pack(fill="x", padx=8, pady=6)
-    tk.Label(frm, text="Конфиг JSON:").pack(side="left")
-    tk.Entry(frm, textvariable=cfg_var, width=56).pack(
-        side="left", padx=4, fill="x", expand=True
-    )
-    tk.Button(frm, text="…", command=browse_cfg).pack(side="left")
-
-    bf = tk.Frame(root)
-    bf.pack(fill="x", padx=8, pady=4)
-    tk.Button(bf, text="Все помещения", command=run_clicked).pack(
-        side="left", padx=4
-    )
-    tk.Button(bf, text="Только выбранные в Renga", command=run_selection).pack(
-        side="left", padx=4
-    )
-
-    log_widget.pack(fill="both", expand=True, padx=8, pady=8)
-    tk.Label(
-        root,
-        text="Перед запуском откройте проект в Renga и задайте три свойства помещений.",
-        fg="#444",
-    ).pack(pady=(0, 6))
-
-    root.mainloop()
-
-
-DEFAULT_CONFIG_PATH = "room_finish_config.json"
-
-
-def console_startup_wizard(
-    default_config: str = DEFAULT_CONFIG_PATH,
-) -> Tuple[str, str, List[int], bool]:
-    """
-    Запрашивает в консоли путь к конфигу, режим обработки и способ подключения к Renga.
-    Возвращает: (config_path, mode, room_ids, prefer_running).
-    """
-    print("=== Renga: пол и стены по контуру помещения ===\n")
-    print("Откройте нужный проект в Renga до запуска обработки.\n")
-
-    path = input("Путь к файлу конфигурации JSON [%s]: " % default_config).strip()
-    if not path:
-        path = default_config
-
-    print(
-        "\nКакие помещения обработать?\n"
-        "  1 — все помещения в модели\n"
-        "  2 — только выбранные в активном виде Renga\n"
-        "  3 — указать числовые id объектов вручную"
-    )
-    choice = input("Ваш выбор [1]: ").strip() or "1"
-
-    mode = "all"
-    ids: List[int] = []
-    if choice == "2":
-        mode = "selection"
-    elif choice == "3":
-        mode = "explicit"
-        raw = input("Id помещений через запятую (например 101, 102, 205): ").strip()
-        for part in raw.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            try:
-                ids.append(int(part))
-            except ValueError:
-                raise ValueError("Некорректный id: %r" % part) from None
-        if not ids:
-            raise ValueError("Для режима 3 нужен хотя бы один id помещения.")
-    elif choice != "1":
-        raise ValueError("Ожидалось 1, 2 или 3, получено: %r" % choice)
-
-    print(
-        "\nПодключение к Renga:\n"
-        "  1 — к уже запущенной программе (рекомендуется)\n"
-        "  2 — отдельный экземпляр через COM (новый процесс)"
-    )
-    conn = input("Ваш выбор [1]: ").strip() or "1"
-    prefer_running = conn != "2"
-
-    print()
-    return path, mode, ids, prefer_running
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Пол и отделочные стены по контуру помещения (Renga COM API)."
-    )
-    parser.add_argument(
-        "--config",
-        "-c",
-        default=DEFAULT_CONFIG_PATH,
-        help="JSON с property_ids (3 шт.) и rules (для неинтерактивного запуска)",
-    )
-    parser.add_argument(
-        "--gui",
-        action="store_true",
-        help="Графический интерфейс (tkinter)",
-    )
-    parser.add_argument(
-        "--selection",
-        action="store_true",
-        help="Только объекты, выбранные в активном виде Renga",
-    )
-    parser.add_argument(
-        "--all-rooms",
-        action="store_true",
-        help="Обработать все помещения модели",
-    )
-    parser.add_argument(
-        "--room-ids",
-        type=str,
-        default="",
-        help="Список id помещений через запятую",
-    )
-    parser.add_argument(
-        "--new-renga",
-        action="store_true",
-        help="Не использовать GetActiveObject (запустить новый экземпляр COM)",
-    )
-    parser.add_argument(
-        "--no-console-prompt",
-        action="store_true",
-        help="Не задавать вопросы в консоли: нужны флаги --all-rooms, --selection или --room-ids",
-    )
-    args = parser.parse_args(argv)
-
-    def log_print(s: str) -> None:
-        print(s)
-
-    if args.gui:
-        _gui_main(args.config)
-        return 0
-
-    explicit_mode = bool(
-        args.selection or args.all_rooms or args.room_ids.strip()
-    )
-
-    try:
-        if not explicit_mode and not args.no_console_prompt:
-            config_path, mode, ids, prefer_running = console_startup_wizard(
-                default_config=args.config
-            )
-        elif explicit_mode:
-            config_path = args.config
-            ids = []
-            if args.selection:
-                mode = "selection"
-            elif args.all_rooms:
-                mode = "all"
-            else:
-                mode = "explicit"
-                ids = [
-                    int(x.strip())
-                    for x in args.room_ids.split(",")
-                    if x.strip()
-                ]
-            prefer_running = not args.new_renga
-        else:
-            print(
-                "Задайте режим в консоли (запустите без --no-console-prompt) или укажите:\n"
-                "  --all-rooms | --selection | --room-ids 101,102",
-                file=sys.stderr,
-            )
-            return 2
-
-        run_batch(
-            config_path,
-            ids,
-            mode,
-            prefer_running=prefer_running,
-            log=log_print,
-        )
-    except Exception as ex:
-        print(ex, file=sys.stderr)
-        traceback.print_exc()
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

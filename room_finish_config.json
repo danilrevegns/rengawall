@@ -21,7 +21,7 @@
         "1": "сухая",
         "2": "чистовая"
       },
-      "create_floor": false,
+      "create_floor": true,
       "create_walls": true,
       "floor_thickness_mm": 100,
       "wall_thickness_mm": 200,
