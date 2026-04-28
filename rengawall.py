@@ -34,23 +34,23 @@ RECORD_PROG_ID = "Renga.Application.1"
 DEFAULT_CONFIG_PATH = "room_finish_config.json"
 
 
-def _norm_guid(g: str) -> str:
+def norm_guid(g: str) -> str:
     g = g.strip().strip("{}").lower()
     return "{" + g + "}"
 
 
-def _load_config(path: str) -> dict:
+def load_cfg(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if "property_ids" not in data or len(data["property_ids"]) != 3:
         raise ValueError("В конфигурации нужен массив property_ids из трёх GUID.")
-    data["property_ids"] = [_norm_guid(x) for x in data["property_ids"]]
+    data["property_ids"] = [norm_guid(x) for x in data["property_ids"]]
     data.setdefault("defaults", {})
     data.setdefault("rules", [])
     return data
 
 
-def _merge_rule(defaults: dict, rule: Optional[dict]) -> dict:
+def merge_rule(defaults: dict, rule: Optional[dict]) -> dict:
     out = dict(defaults)
     if rule:
         for k, v in rule.items():
@@ -59,67 +59,47 @@ def _merge_rule(defaults: dict, rule: Optional[dict]) -> dict:
     return out
 
 
-def _find_rule(cfg: dict, triple: Tuple[str, str, str]) -> Optional[dict]:
+def find_rule(cfg: dict, triple: Tuple[str, str, str]) -> Optional[dict]:
     a, b, c = (x.strip().lower() for x in triple)
-
-    def val(rule_match: dict, idx: int) -> str:
-        return str(rule_match.get(str(idx), "")).strip().lower()
-
     for rule in cfg.get("rules", []):
         m = rule.get("match") or {}
-        if val(m, 0) == a and val(m, 1) == b and val(m, 2) == c:
+        if str(m.get("0", "")).strip().lower() == a and \
+           str(m.get("1", "")).strip().lower() == b and \
+           str(m.get("2", "")).strip().lower() == c:
             return rule
     return None
 
 
-def _get_property_text(prop) -> str:
+def get_prop(prop) -> str:
     """Читает значение свойства в строку для сопоставления с правилами."""
-    if prop is None:
-        return ""
+    if not prop: return ""
     try:
-        if not prop.HasValue:
-            return ""
-    except Exception:
-        pass
-    t = getattr(prop, "Type", None)
-    try:
-        if t is not None:
-            name = str(t)
-            if "String" in name:
-                return str(prop.GetStringValue()).strip()
-    except Exception:
-        pass
-    for getter in (
-        "GetStringValue",
-        "GetEnumerationValue",
-        "GetIntValue",
-        "GetIntegerValue",
-        "GetDoubleValue",
-        "GetBoolValue",
-    ):
+        if not prop.HasValue: return ""
+    except Exception: pass
+
+    if "String" in str(getattr(prop, "Type", "")):
+        try: return str(prop.GetStringValue()).strip()
+        except Exception: pass
+
+    for getter in ("GetStringValue", "GetEnumerationValue", "GetIntValue", "GetIntegerValue", "GetDoubleValue", "GetBoolValue"):
         if hasattr(prop, getter):
             try:
                 v = getattr(prop, getter)()
-                if v is not None:
-                    return str(v).strip()
-            except Exception:
-                continue
+                if v is not None: return str(v).strip()
+            except Exception: pass
     return ""
 
 
-def _room_type_triple(model_object, property_ids: List[str]) -> Tuple[str, str, str]:
+def room_type(model_object, property_ids: List[str]) -> Tuple[str, str, str]:
     pc = model_object.GetProperties()
-    out: List[str] = []
-    for pid in property_ids:
-        try:
-            p = pc.GetS(pid)
-        except Exception:
-            p = None
-        out.append(_get_property_text(p))
-    return out[0], out[1], out[2]
+    def get_p(pid):
+        try: return get_prop(pc.GetS(pid))
+        except Exception: return ""
+    res = [get_p(pid) for pid in property_ids[:3]]
+    return res[0], res[1], res[2]
 
 
-def _load_renga_comtypes():
+def load_com():
     """Типы Point2D/Placement3D из TLB Renga."""
     import comtypes.client.dynamic as dynamic
     import comtypes.gen.Renga as Renga
@@ -127,7 +107,7 @@ def _load_renga_comtypes():
     return Renga, dynamic
 
 
-def _dispatch_iface(ptr, dynamic_mod) -> Any:
+def dispatch(ptr, dynamic_mod) -> Any:
     if ptr is None:
         return None
     try:
@@ -136,7 +116,7 @@ def _dispatch_iface(ptr, dynamic_mod) -> Any:
         return None
 
 
-def _query_iface(com_obj, Renga, iface_name: str, dynamic_mod) -> Any:
+def query(com_obj, Renga, iface_name: str, dynamic_mod) -> Any:
     """
     Предпочтительно QueryInterface(типизированный интерфейс) — иначе Renga может
     падать с RPC_E_SERVERFAULT при вызовах через «ломаный» Dispatch.
@@ -147,10 +127,10 @@ def _query_iface(com_obj, Renga, iface_name: str, dynamic_mod) -> Any:
             return com_obj.QueryInterface(iface)
         except Exception:
             pass
-    return _dispatch_iface(com_obj.GetInterfaceByName(iface_name), dynamic_mod)
+    return dispatch(com_obj.GetInterfaceByName(iface_name), dynamic_mod)
 
 
-def _placement_axes_2d(Renga, placement) -> Tuple[Any, Any, Any]:
+def get_axes(Renga, placement) -> Tuple[Any, Any, Any]:
     """Origin, axis X, axis Y в плоскости этажа."""
     origin = placement.Origin
     axis_x = placement.AxisX
@@ -181,125 +161,60 @@ def _placement_axes_2d(Renga, placement) -> Tuple[Any, Any, Any]:
     return origin, axis_x, v
 
 
-def _sample_arc_points_xy(prim, n: int, log: Callable[[str], None]) -> List[Tuple[float, float]]:
-    """Параметрическая выборка дуги (если API доступен), иначе только концы."""
+def sample_arc(prim, n: int, log: Callable[[str], None]) -> List[Tuple[float, float]]:
     pts: List[Tuple[float, float]] = []
+    methods = ("Evaluate", "EvaluateCurve", "GetPoint", "GetPointByParameter", "GetParameterPoint")
     for k in range(n + 1):
         t = k / n if n else 1.0
         p = None
-        for name in (
-            "Evaluate",
-            "EvaluateCurve",
-            "GetPoint",
-            "GetPointByParameter",
-            "GetParameterPoint",
-        ):
-            if not hasattr(prim, name):
-                continue
-            try:
-                pt = getattr(prim, name)(t)
-                p = (float(pt.X), float(pt.Y))
-                break
-            except Exception:
-                continue
-        if p is None:
-            break
-        if not pts or (
-            abs(pts[-1][0] - p[0]) > 1e-9 or abs(pts[-1][1] - p[1]) > 1e-9
-        ):
+        for name in methods:
+            if hasattr(prim, name):
+                try:
+                    pt = getattr(prim, name)(t)
+                    p = (float(pt.X), float(pt.Y))
+                    break
+                except Exception: pass
+        if not p: break
+        if not pts or abs(pts[-1][0] - p[0]) > 1e-9 or abs(pts[-1][1] - p[1]) > 1e-9:
             pts.append(p)
-    if len(pts) >= 2:
-        return pts
-    ends = _curve_endpoints(prim)
-    if not ends:
-        return []
-    (sx, sy), (ex, ey) = ends
-    return [(sx, sy), (ex, ey)]
+    if len(pts) >= 2: return pts
+    ends = curve_ends(prim)
+    return list(ends) if ends else []
 
 
-def _outer_contour_vertex_chain_global(
-    region_desc,
-    Renga,
-    log: Callable[[str], None],
-) -> List[Tuple[float, float]]:
-    """Упорядоченные вершины внешнего контура в ГСК (план)."""
+def get_verts(region_desc, Renga, log: Callable[[str], None]) -> List[Tuple[float, float]]:
     verts: List[Tuple[float, float]] = []
-    for prim in _iter_outer_segments(region_desc, Renga):
-        try:
-            ct = int(prim.Curve2DType)
-        except Exception:
-            ct = CURVE2D_LINE
-        if ct == CURVE2D_LINE:
-            ends = _curve_endpoints(prim)
-            if not ends:
-                continue
-            (sx, sy), (ex, ey) = ends
-            if not verts:
-                verts.append((sx, sy))
-            verts.append((ex, ey))
-        elif ct == CURVE2D_ARC:
-            arc_pts = _sample_arc_points_xy(prim, 12, log)
-            if not arc_pts:
-                continue
-            if not verts:
-                verts.append(arc_pts[0])
-            for p in arc_pts[1:]:
-                verts.append(p)
+    for prim in iter_outer(region_desc, Renga):
+        ct = getattr(prim, "Curve2DType", CURVE2D_LINE)
+        if ct == CURVE2D_ARC:
+            pts = sample_arc(prim, 12, log)
         else:
-            ends = _curve_endpoints(prim)
-            if not ends:
-                log(
-                    "Сегмент типа %s без концов — пропуск при построении контура пола."
-                    % ct
-                )
-                continue
-            (sx, sy), (ex, ey) = ends
-            if not verts:
-                verts.append((sx, sy))
-            verts.append((ex, ey))
-    if len(verts) >= 2:
-        a, b = verts[0], verts[-1]
-        if math.hypot(a[0] - b[0], a[1] - b[1]) < 1e-3:
-            verts.pop()
+            pts = list(curve_ends(prim) or [])
+            if not pts and ct != CURVE2D_LINE:
+                log(f"Сегмент {ct} без концов — пропуск.")
+                
+        for p in pts:
+            if not verts or math.hypot(verts[-1][0] - p[0], verts[-1][1] - p[1]) > 1e-6:
+                verts.append(p)
+                
+    if len(verts) >= 2 and math.hypot(verts[0][0] - verts[-1][0], verts[0][1] - verts[-1][1]) < 1e-3:
+        verts.pop()
     return verts
 
 
-def _vertex_chain_to_closed_global_lines(
-    math_iface,
-    Renga,
-    verts: List[Tuple[float, float]],
-    log: Callable[[str], None],
-) -> List:
-    """Замкнутый контур из отрезков в глобальных координатах."""
-    if len(verts) < 2:
-        return []
-    cleaned: List[Tuple[float, float]] = [verts[0]]
-    for p in verts[1:]:
-        if (
-            math.hypot(p[0] - cleaned[-1][0], p[1] - cleaned[-1][1]) > 1e-6
-        ):
-            cleaned.append(p)
-    if len(cleaned) < 2:
-        return []
+def get_lines(math_iface, Renga, verts: List[Tuple[float, float]], log: Callable[[str], None]) -> List:
+    if len(verts) < 2: return []
     lines = []
-    n = len(cleaned)
-    for i in range(n):
-        p1 = cleaned[i]
-        p2 = cleaned[(i + 1) % n]
-        try:
-            lines.append(
-                math_iface.CreateLineSegment2D(
-                    _point2d(Renga, p1[0], p1[1]),
-                    _point2d(Renga, p2[0], p2[1]),
-                )
-            )
+    for i, p1 in enumerate(verts):
+        p2 = verts[(i + 1) % len(verts)]
+        try: lines.append(math_iface.CreateLineSegment2D(pt2d(Renga, *p1), pt2d(Renga, *p2)))
         except Exception as ex:
-            log("CreateLineSegment2D (контур пола): %s" % ex)
+            log(f"CreateLineSegment2D: {ex}")
             return []
     return lines
 
 
-def _local_xy_to_global_xy(
+def to_global(
     lx: float,
     ly: float,
     origin,
@@ -311,7 +226,7 @@ def _local_xy_to_global_xy(
     return gx, gy
 
 
-def _global_xy_to_local_xy(
+def to_local(
     gx: float,
     gy: float,
     origin,
@@ -326,7 +241,7 @@ def _global_xy_to_local_xy(
     return lx, ly
 
 
-def _curve_list_global_to_local_lines(
+def local_lines(
     math_iface,
     Renga,
     curves: List,
@@ -345,14 +260,14 @@ def _curve_list_global_to_local_lines(
         if ct != CURVE2D_LINE:
             log("Пропуск сегмента не-линии при переводе контура пола в локальные координаты.")
             continue
-        ends = _curve_endpoints(c)
+        ends = curve_ends(c)
         if not ends:
             continue
         (sx, sy), (ex, ey) = ends
-        lsx, lsy = _global_xy_to_local_xy(sx, sy, origin, axis_x, axis_y)
-        lex, ley = _global_xy_to_local_xy(ex, ey, origin, axis_x, axis_y)
-        p1 = _point2d(Renga, lsx, lsy)
-        p2 = _point2d(Renga, lex, ley)
+        lsx, lsy = to_local(sx, sy, origin, axis_x, axis_y)
+        lex, ley = to_local(ex, ey, origin, axis_x, axis_y)
+        p1 = pt2d(Renga, lsx, lsy)
+        p2 = pt2d(Renga, lex, ley)
         try:
             out.append(math_iface.CreateLineSegment2D(p1, p2))
         except Exception as ex:
@@ -360,7 +275,7 @@ def _curve_list_global_to_local_lines(
     return out
 
 
-def _ensure_closed_polyline_lines(
+def close_lines(
     math_iface,
     Renga,
     lines: List,
@@ -378,8 +293,8 @@ def _ensure_closed_polyline_lines(
         dy = float(b.Y) - float(e.Y)
         if math.hypot(dx, dy) <= tol:
             return lines
-        p1 = _point2d(Renga, float(e.X), float(e.Y))
-        p2 = _point2d(Renga, float(b.X), float(b.Y))
+        p1 = pt2d(Renga, float(e.X), float(e.Y))
+        p2 = pt2d(Renga, float(b.X), float(b.Y))
         lines = list(lines)
         lines.append(math_iface.CreateLineSegment2D(p1, p2))
     except Exception:
@@ -387,7 +302,7 @@ def _ensure_closed_polyline_lines(
     return lines
 
 
-def _connect_app(prefer_running: bool):
+def connect(prefer_running: bool):
     import comtypes.client
 
     if prefer_running:
@@ -398,22 +313,22 @@ def _connect_app(prefer_running: bool):
     return comtypes.client.CreateObject(RECORD_PROG_ID)
 
 
-def _comtypes_renga_available() -> bool:
+def has_renga() -> bool:
     try:
-        _load_renga_comtypes()
+        load_com()
         return True
     except Exception:
         return False
 
 
-def _point2d(Renga, x: float, y: float):
+def pt2d(Renga, x: float, y: float):
     p = Renga.Point2D()
     p.X = float(x)
     p.Y = float(y)
     return p
 
 
-def _point3d(Renga, x: float, y: float, z: float):
+def pt3d(Renga, x: float, y: float, z: float):
     p = Renga.Point3D()
     p.X = float(x)
     p.Y = float(y)
@@ -421,7 +336,7 @@ def _point3d(Renga, x: float, y: float, z: float):
     return p
 
 
-def _vector3d(Renga, x: float, y: float, z: float):
+def vec3d(Renga, x: float, y: float, z: float):
     v = Renga.Vector3D()
     v.X = float(x)
     v.Y = float(y)
@@ -429,16 +344,16 @@ def _vector3d(Renga, x: float, y: float, z: float):
     return v
 
 
-def _placement2d_identity(Renga):
+def ident_pl(Renga):
     pl = Renga.Placement2D()
-    pl.Origin = _point2d(Renga, 0.0, 0.0)
+    pl.Origin = pt2d(Renga, 0.0, 0.0)
     v = Renga.Vector2D()
     v.X, v.Y = 1.0, 0.0
     pl.xAxis = v
     return pl
 
 
-def _curve_endpoints(curve) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+def curve_ends(curve) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
     try:
         b = curve.GetBeginPoint()
         e = curve.GetEndPoint()
@@ -447,7 +362,7 @@ def _curve_endpoints(curve) -> Optional[Tuple[Tuple[float, float], Tuple[float, 
         return None
 
 
-def _atomic_curve_segments(curve, Renga, depth: int = 0) -> List:
+def get_segs(curve, Renga, depth: int = 0) -> List:
     """
     Рекурсивно раскрывает контур до атомарных ICurve2D (отрезок/дуга).
     Сначала QueryInterface(IPolyCurve2D) — в TLB тип Curve2DType может быть Undefined,
@@ -475,7 +390,7 @@ def _atomic_curve_segments(curve, Renga, depth: int = 0) -> List:
                 continue
             if sub is None:
                 continue
-            out.extend(_atomic_curve_segments(sub, Renga, depth + 1))
+            out.extend(get_segs(sub, Renga, depth + 1))
         return out if out else [curve]
     try:
         ct = int(curve.Curve2DType)
@@ -486,7 +401,7 @@ def _atomic_curve_segments(curve, Renga, depth: int = 0) -> List:
     return [curve]
 
 
-def _ring_centroid_xy(verts: List[Tuple[float, float]]) -> Tuple[float, float]:
+def centroid(verts: List[Tuple[float, float]]) -> Tuple[float, float]:
     if not verts:
         return 0.0, 0.0
     sx = sum(x for x, _ in verts)
@@ -495,7 +410,7 @@ def _ring_centroid_xy(verts: List[Tuple[float, float]]) -> Tuple[float, float]:
     return sx / n, sy / n
 
 
-def _inward_normal_for_segment(
+def inward_norm(
     sx: float,
     sy: float,
     ex: float,
@@ -527,7 +442,7 @@ def _inward_normal_for_segment(
     return n1x, n1y
 
 
-def _room_seed_point(room_iface) -> Optional[Tuple[float, float]]:
+def room_seed(room_iface) -> Optional[Tuple[float, float]]:
     try:
         if bool(room_iface.Automatic):
             cp = room_iface.ControlPoint
@@ -541,65 +456,33 @@ def _room_seed_point(room_iface) -> Optional[Tuple[float, float]]:
         return None
 
 
-def _try_calculate_room_region(
-    room_iface, Renga, log: Callable[[str], None]
-):
-    """
-    comtypes.gen.Renga.Point2D совместим с CalculateRegion (как в тестах).
-    """
-    candidates = []
-    try:
-        if bool(room_iface.Automatic):
-            candidates.append(("ControlPoint", room_iface.ControlPoint))
-    except Exception:
-        pass
-    try:
-        candidates.append(("MarkerPosition", room_iface.MarkerPosition))
-    except Exception:
-        pass
-
-    last_error: Optional[Exception] = None
-    for _name, pt in candidates:
-        if pt is None:
-            continue
+def calc_region(room_iface, Renga, log: Callable[[str], None]):
+    pts = []
+    if getattr(room_iface, "Automatic", False):
+        pts.append(getattr(room_iface, "ControlPoint", None))
+    pts.append(getattr(room_iface, "MarkerPosition", None))
+    
+    seed = room_seed(room_iface)
+    if seed: pts.append(pt2d(Renga, *seed))
+    
+    last_err = None
+    for pt in filter(None, pts):
         try:
-            rd = room_iface.CalculateRegion(pt)
-            if rd:
-                return rd
-        except Exception as ex:
-            last_error = ex
-            continue
-
-    seed = _room_seed_point(room_iface)
-    if seed:
-        pt = Renga.Point2D()
-        pt.X = float(seed[0])
-        pt.Y = float(seed[1])
-        try:
-            rd = room_iface.CalculateRegion(pt)
-            if rd:
-                return rd
-        except Exception as ex:
-            last_error = ex
-
-    if last_error is not None:
-        log("CalculateRegion не удался: %s" % last_error)
-    else:
-        log(
-            "CalculateRegion вернул пусто (точка вне помещения, на границе "
-            "или нет подходящей опорной точки)."
-        )
+            if rd := room_iface.CalculateRegion(pt): return rd
+        except Exception as ex: last_err = ex
+        
+    log(f"CalculateRegion не удался: {last_err}" if last_err else "CalculateRegion вернул пусто.")
     return None
 
 
-def _iter_outer_segments(region_desc, Renga) -> Iterator:
+def iter_outer(region_desc, Renga) -> Iterator:
     reg = region_desc.Region
     outer = reg.GetOuterContour()
-    for prim in _atomic_curve_segments(outer, Renga, 0):
+    for prim in get_segs(outer, Renga, 0):
         yield prim
 
 
-def _set_floor_baseline(
+def set_base(
     floor_mo,
     composite_curve,
     Renga,
@@ -607,7 +490,7 @@ def _set_floor_baseline(
     log: Callable[[str], None],
 ) -> bool:
     """Перекрытие: контур в ЛСК объекта — IBaseline2DObject.SetBaseline (test_floor_coor.py)."""
-    bl = _query_iface(floor_mo, Renga, "IBaseline2DObject", dynamic_mod)
+    bl = query(floor_mo, Renga, "IBaseline2DObject", dynamic_mod)
     if not bl:
         log("IBaseline2DObject недоступен для пола.")
         return False
@@ -619,7 +502,7 @@ def _set_floor_baseline(
         return False
 
 
-def _try_composite_curve(math_iface, curves: List) -> Any:
+def comp_curve(math_iface, curves: List) -> Any:
     if not curves:
         return None
     try:
@@ -633,22 +516,22 @@ def _try_composite_curve(math_iface, curves: List) -> Any:
     return None
 
 
-def _set_params_double(obj, guid_s: str, value: float) -> None:
+def set_param(obj, guid_s: str, value: float) -> None:
     params = obj.GetParameters()
     p = params.GetS(guid_s)
     if p:
         p.SetDoubleValue(float(value))
 
 
-def _init_finish_wall_parameters(
+def init_wall(
     wall_mo, wh: float, wt: float
 ) -> None:
     """Параметры стены."""
-    _set_params_double(wall_mo, PARAM_WALL_HEIGHT, wh)
-    _set_params_double(wall_mo, PARAM_WALL_THICKNESS, wt)
+    set_param(wall_mo, PARAM_WALL_HEIGHT, wh)
+    set_param(wall_mo, PARAM_WALL_THICKNESS, wt)
 
 
-def process_room(
+def proc_room(
     app,
     model,
     objects,
@@ -657,7 +540,7 @@ def process_room(
     log: Callable[[str], None],
 ) -> None:
     try:
-        Renga, dynamic = _load_renga_comtypes()
+        Renga, dynamic = load_com()
     except Exception as ex:
         log(
             "Не загружен comtypes.gen.Renga (запустите скрипт один раз при открытой Renga "
@@ -669,14 +552,14 @@ def process_room(
         log("Пропуск: объект не помещение (id=%s)." % room_mo.Id)
         return
 
-    room = _query_iface(room_mo, Renga, "IRoom", dynamic)
+    room = query(room_mo, Renga, "IRoom", dynamic)
     if not room:
         log("Не удалось получить IRoom (id=%s)." % room_mo.Id)
         return
 
-    triple = _room_type_triple(room_mo, cfg["property_ids"])
-    rule = _find_rule(cfg, triple)
-    merged = _merge_rule(cfg["defaults"], rule)
+    triple = room_type(room_mo, cfg["property_ids"])
+    rule = find_rule(cfg, triple)
+    merged = merge_rule(cfg["defaults"], rule)
     if rule is None:
         log(
             "Помещение id=%s: нет правила для (%r, %r, %r), используются defaults."
@@ -688,22 +571,22 @@ def process_room(
             % (room_mo.Id, triple[0], triple[1], triple[2])
         )
 
-    seed = _room_seed_point(room)
+    seed = room_seed(room)
     if not seed:
         log("Не удалось опорную точку помещения id=%s." % room_mo.Id)
         return
 
-    region_desc = _try_calculate_room_region(room, Renga, log)
+    region_desc = calc_region(room, Renga, log)
     if not region_desc:
         return
 
-    level_obj = _query_iface(room_mo, Renga, "ILevelObject", dynamic)
+    level_obj = query(room_mo, Renga, "ILevelObject", dynamic)
     if not level_obj:
         log("Нет ILevelObject у помещения.")
         return
     level_id = int(level_obj.LevelId)
     level_mo = objects.GetById(level_id)
-    ilvl = _query_iface(level_mo, Renga, "ILevel", dynamic)
+    ilvl = query(level_mo, Renga, "ILevel", dynamic)
     if not ilvl:
         log("Не найден уровень id=%s." % level_id)
         return
@@ -711,8 +594,8 @@ def process_room(
     math = app.Math
     project = app.Project
 
-    floor_verts = _outer_contour_vertex_chain_global(region_desc, Renga, log)
-    floor_global_lines = _vertex_chain_to_closed_global_lines(
+    floor_verts = get_verts(region_desc, Renga, log)
+    floor_global_lines = get_lines(
         math, Renga, floor_verts, log
     )
     if not floor_global_lines:
@@ -736,9 +619,9 @@ def process_room(
             floor_mo = model.CreateObject(args)
             if floor_mo:
                 ft = float(merged.get("floor_thickness_mm", 50))
-                _set_params_double(floor_mo, PARAM_FLOOR_THICKNESS, ft)
+                set_param(floor_mo, PARAM_FLOOR_THICKNESS, ft)
                 pl_floor = None
-                disp_fl = _query_iface(
+                disp_fl = query(
                     floor_mo, Renga, "ILevelObject", dynamic
                 )
                 if disp_fl:
@@ -759,21 +642,21 @@ def process_room(
                             pl_floor = None
                 comp_floor = None
                 if pl_floor and floor_global_lines:
-                    o, ax, ay = _placement_axes_2d(Renga, pl_floor)
-                    loc_lines = _curve_list_global_to_local_lines(
+                    o, ax, ay = get_axes(Renga, pl_floor)
+                    loc_lines = local_lines(
                         math, Renga, floor_global_lines, o, ax, ay, log
                     )
-                    loc_lines = _ensure_closed_polyline_lines(
+                    loc_lines = close_lines(
                         math, Renga, loc_lines
                     )
-                    comp_floor = _try_composite_curve(math, loc_lines)
+                    comp_floor = comp_curve(math, loc_lines)
                 if not comp_floor:
                     log(
                         "Контур пола в ЛСК не собран — пробую глобальный контур "
                         "(при сбое Renga проверьте контур и Placement перекрытия)."
                     )
-                    comp_floor = _try_composite_curve(math, floor_global_lines)
-                if comp_floor and _set_floor_baseline(
+                    comp_floor = comp_curve(math, floor_global_lines)
+                if comp_floor and set_base(
                     floor_mo, comp_floor, Renga, dynamic, log
                 ):
                     log("Пол создан (id=%s)." % floor_mo.Id)
@@ -790,7 +673,7 @@ def process_room(
             wt = float(merged.get("wall_thickness_mm", 120))
             wstyle = int(merged.get("wall_style_id", 0) or 0)
             
-            cx_c, cy_c = _ring_centroid_xy(floor_verts)
+            cx_c, cy_c = centroid(floor_verts)
             geom_inset = merged.get("wall_geometric_inset_from_contour", True)
             raw_inset = merged.get("wall_contour_inset_mm", None)
             if not geom_inset:
@@ -800,7 +683,7 @@ def process_room(
             else:
                 wall_inset_mm = wt * 0.5
                 
-            for prim in _iter_outer_segments(region_desc, Renga):
+            for prim in iter_outer(region_desc, Renga):
                 wall_mo = None
                 try:
                     ct = int(prim.Curve2DType)
@@ -812,12 +695,12 @@ def process_room(
                 if wstyle:
                     args.StyleId = wstyle
                 if ct == CURVE2D_LINE:
-                    ends = _curve_endpoints(prim)
+                    ends = curve_ends(prim)
                     if not ends:
                         continue
                     (sx, sy), (ex, ey) = ends
                     if wall_inset_mm > 1e-6:
-                        nrm = _inward_normal_for_segment(
+                        nrm = inward_norm(
                             sx,
                             sy,
                             ex,
@@ -837,29 +720,29 @@ def process_room(
                     wall_mo = model.CreateObject(args)
                     if not wall_mo:
                         continue
-                    _init_finish_wall_parameters(wall_mo, wh, wt)
-                    bl = _query_iface(
+                    init_wall(wall_mo, wh, wt)
+                    bl = query(
                         wall_mo, Renga, "IBaseline2DObject", dynamic
                     )
                     if bl:
                         loc = math.CreateLineSegment2D(
-                            _point2d(Renga, sx, sy),
-                            _point2d(Renga, ex, ey),
+                            pt2d(Renga, sx, sy),
+                            pt2d(Renga, ex, ey),
                         )
                         bl.SetBaseline(loc)
                 elif ct == CURVE2D_ARC:
                     wall_mo = model.CreateObject(args)
                     if not wall_mo:
                         continue
-                    _init_finish_wall_parameters(wall_mo, wh, wt)
-                    bl = _query_iface(
+                    init_wall(wall_mo, wh, wt)
+                    bl = query(
                         wall_mo, Renga, "IBaseline2DObject", dynamic
                     )
                     if bl:
                         try:
                             arc_c = prim.GetCopy()
                             bl.SetBaselineInCS(
-                                _placement2d_identity(Renga), arc_c
+                                ident_pl(Renga), arc_c
                             )
                         except Exception as ex:
                             log("Дуга стены id=%s: %s" % (wall_mo.Id, ex))
@@ -876,62 +759,37 @@ def process_room(
         raise
 
 
-def collect_room_ids(
-    app, model, mode: str, explicit: List[int]
-) -> List[int]:
+def get_rooms(app, model, mode: str, explicit: List[int]) -> List[int]:
     objects = model.GetObjects()
+    def is_room(mo): return mo and mo.ObjectTypeS.lower() == ENTITY_ROOM.lower()
+    
     if mode == "selection":
-        sel = app.Selection
-        ids = list(sel.GetSelectedObjects())
-        rooms = []
-        for oid in ids:
-            mo = objects.GetById(int(oid))
-            if mo and mo.ObjectTypeS.lower() == ENTITY_ROOM.lower():
-                rooms.append(int(oid))
-        return rooms
+        return [int(oid) for oid in app.Selection.GetSelectedObjects() if is_room(objects.GetById(int(oid)))]
     if mode == "all":
-        rooms = []
         try:
-            for obj_id in objects.GetIds():
-                mo = objects.GetById(int(obj_id))
-                if mo and mo.ObjectTypeS.lower() == ENTITY_ROOM.lower():
-                    rooms.append(int(mo.Id))
+            return [int(mo.Id) for oid in objects.GetIds() if is_room(mo := objects.GetById(int(oid)))]
         except Exception:
-            n = int(objects.Count)
-            for i in range(n):
-                mo = objects.GetByIndex(i)
-                if mo and mo.ObjectTypeS.lower() == ENTITY_ROOM.lower():
-                    rooms.append(int(mo.Id))
-        return rooms
+            return [int(mo.Id) for i in range(objects.Count) if is_room(mo := objects.GetByIndex(i))]
     return list(explicit)
 
 
-def run_batch(
-    config_path: str,
-    room_ids: List[int],
-    mode: str,
-    prefer_running: bool,
-    log: Callable[[str], None],
-) -> None:
-    if not _comtypes_renga_available():
-        raise RuntimeError(
-            "Не импортируется comtypes.gen.Renga. Выполните: pip install comtypes, "
-            "запустите Renga с проектом и повторите (typelib генерируется при первом доступе)."
-        )
-    cfg = _load_config(config_path)
-    app = _connect_app(prefer_running)
+def run_batch(config_path: str, room_ids: List[int], mode: str, prefer_running: bool, log: Callable[[str], None]) -> None:
+    if not has_renga():
+        raise RuntimeError("Не импортируется comtypes.gen.Renga. Выполните: pip install comtypes.")
+    
+    cfg = load_cfg(config_path)
+    app = connect(prefer_running)
     app.Visible = True
     if not app.HasProject:
         raise RuntimeError("В Renga нет открытого проекта.")
-    project = app.Project
-    model = project.Model
+    
+    model = app.Project.Model
     objects = model.GetObjects()
-    ids = collect_room_ids(app, model, mode, room_ids)
+    ids = get_rooms(app, model, mode, room_ids)
     if not ids:
-        raise RuntimeError("Нет помещений для обработки (проверьте выбор или список id).")
+        raise RuntimeError("Нет помещений для обработки.")
+        
     for rid in ids:
         mo = objects.GetById(int(rid))
-        if not mo:
-            log("Объект id=%s не найден." % rid)
-            continue
-        process_room(app, model, objects, mo, cfg, log)
+        if mo: proc_room(app, model, objects, mo, cfg, log)
+        else: log(f"Объект id={rid} не найден.")
