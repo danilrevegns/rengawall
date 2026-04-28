@@ -774,11 +774,12 @@ def get_rooms(app, model, mode: str, explicit: List[int]) -> List[int]:
 
 
 def run_batch(config_path: str, room_ids: List[int], mode: str, prefer_running: bool, log: Callable[[str], None]) -> None:
+    app = connect(prefer_running)
+    
     if not has_renga():
         raise RuntimeError("Не импортируется comtypes.gen.Renga. Выполните: pip install comtypes.")
     
     cfg = load_cfg(config_path)
-    app = connect(prefer_running)
     app.Visible = True
     if not app.HasProject:
         raise RuntimeError("В Renga нет открытого проекта.")
